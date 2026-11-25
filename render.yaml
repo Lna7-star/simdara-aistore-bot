@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: simdara-aistore-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        value: "5767196740"
+      - key: SUPPORT_USERNAME
+        value: "@simdara_aistore2026_bot"
