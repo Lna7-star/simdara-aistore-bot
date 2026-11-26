@@ -194,6 +194,7 @@ def back_menu():
 # ---------- User handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting", None)
     user = update.effective_user
     ensure_user(user)
     text = (
@@ -384,6 +385,7 @@ async def topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     method = query.data.split("_")[1]
     context.user_data["topup_method"] = method
+    context.user_data["awaiting"] = "topup_amount"
     if method == "ABA":
         info = f"🏦 **ABA KHQR**\nឈ្មោះ៖ {ABA_NAME}\nគណនី៖ {ABA_ACCOUNT}\n\nស្កេន KHQR ឬផ្ទេរតាមលេខគណនីខាងលើ។"
     elif method == "Wing":
@@ -395,17 +397,18 @@ async def topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=back_menu(),
         parse_mode="Markdown",
     )
-    return TOPUP_AMOUNT
 
 
 async def topup_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting", None)
     try:
         amount = float(update.message.text.strip().replace("$", ""))
         if amount <= 0:
             raise ValueError
     except ValueError:
+        context.user_data["awaiting"] = "topup_amount"
         await update.message.reply_text("សូមវាយចំនួនលុយជាលេខ ឧទាហរណ៍ 10")
-        return TOPUP_AMOUNT
+        return
 
     method = context.user_data.get("topup_method", "ABA")
     user = update.effective_user
@@ -441,7 +444,6 @@ async def topup_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception as e:
             logger.warning("Cannot notify admin %s: %s", admin_id, e)
-    return ConversationHandler.END
 
 
 async def approve_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,9 +566,9 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addstock_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("អ្នកមិនមែន Admin ទេ។")
-        return ConversationHandler.END
+        return
+    context.user_data["awaiting"] = "addstock_product"
     await update.message.reply_text("សូមវាយ ID ផលិតផលដែលចង់បន្ថែមស្តុក។ មើល ID ដោយ /admin")
-    return ADDSTOCK_PRODUCT
 
 
 async def addstock_product_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -574,14 +576,15 @@ async def addstock_product_received(update: Update, context: ContextTypes.DEFAUL
         pid = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("ID ត្រូវតែជាលេខ។")
-        return ADDSTOCK_PRODUCT
+        return
     conn = get_db()
     p = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
     conn.close()
     if not p:
         await update.message.reply_text("រកមិនឃើញផលិតផល ID នេះទេ។")
-        return ADDSTOCK_PRODUCT
+        return
     context.user_data["addstock_pid"] = pid
+    context.user_data["awaiting"] = "addstock_lines"
     await update.message.reply_text(
         f"ផលិតផល៖ {p['name']}\n\n"
         "សូមផ្ញើស្តុកជាបន្ទាត់ៗ ទម្រង់៖\n"
@@ -592,10 +595,10 @@ async def addstock_product_received(update: Update, context: ContextTypes.DEFAUL
         "test2@gmail.com:pass456",
         parse_mode="Markdown",
     )
-    return ADDSTOCK_LINES
 
 
 async def addstock_lines_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting", None)
     pid = context.user_data.get("addstock_pid")
     lines = [l.strip() for l in update.message.text.strip().splitlines() if ":" in l]
     conn = get_db()
@@ -610,7 +613,6 @@ async def addstock_lines_received(update: Update, context: ContextTypes.DEFAULT_
     conn.commit()
     conn.close()
     await update.message.reply_text(f"✅ បានបន្ថែមស្តុក {added} គណនីទៅផលិតផល ID {pid} ហើយ។ ស្តុកសរុបឥឡូវ៖ {stock_count(pid)}")
-    return ConversationHandler.END
 
 
 async def approve_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,8 +663,24 @@ async def pending_topups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("addstock_pid", None)
+    context.user_data.pop("topup_method", None)
     await update.message.reply_text("បានបោះបង់។", reply_markup=main_menu())
-    return ConversationHandler.END
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dispatch plain-text replies based on what the bot is waiting for.
+    This replaces the two ConversationHandlers, which blocked each other
+    and blocked /start and the ABA/Wing/USDT buttons."""
+    awaiting = context.user_data.get("awaiting")
+    if awaiting == "topup_amount":
+        await topup_amount_received(update, context)
+    elif awaiting == "addstock_product":
+        await addstock_product_received(update, context)
+    elif awaiting == "addstock_lines":
+        await addstock_lines_received(update, context)
+    # else: no pending input, ignore the text
 
 
 # ---------- Main ----------
@@ -675,30 +693,22 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Topup conversation - ត្រូវដាក់មុន Callback handler ទូទៅ
-    topup_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(topup_method, pattern=r"^topup_(ABA|Wing|USDT)$")],
-        states={TOPUP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_amount_received)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-    )
+    # /start និង /cancel ដាក់ក្នុង group -1 ដើម្បីឲ្យដំណើរការជានិច្ច
+    # ទោះ Bot កំពុងរង់ចាំចម្លើយក្នុងជំហានណាក៏ដោយ (មុននេះ ConversationHandler
+    # បានបិទ /start និងប៊ូតុង ABA/Wing/USDT មិនឲ្យដើរ)
+    app.add_handler(CommandHandler("start", start), group=-1)
+    app.add_handler(CommandHandler("cancel", cancel), group=-1)
 
-    addstock_conv = ConversationHandler(
-        entry_points=[CommandHandler("addstock", addstock_start)],
-        states={
-            ADDSTOCK_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addstock_product_received)],
-            ADDSTOCK_LINES: [MessageHandler(filters.TEXT & ~filters.COMMAND, addstock_lines_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("addproduct", add_product))
+    app.add_handler(CommandHandler("addstock", addstock_start))
     app.add_handler(CommandHandler("approve", approve_direct))
     app.add_handler(CommandHandler("pending", pending_topups))
-    app.add_handler(addstock_conv)
-    app.add_handler(topup_conv)
+
+    # Topup: ប៊ូតុងជ្រើសវិធីបង់ប្រាក់ (លែងប្រើ ConversationHandler ទៀតហើយ)
+    app.add_handler(CallbackQueryHandler(topup_method, pattern=r"^topup_(ABA|Wing|USDT)$"))
+    # អត្ថបទធម្មតា (ចំនួនលុយ / ID ផលិតផល / ស្តុក) បញ្ជូនតាម handle_text_input
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     app.add_handler(CallbackQueryHandler(show_products, pattern=r"^products$"))
     app.add_handler(CallbackQueryHandler(show_product, pattern=r"^product_\d+$"))
